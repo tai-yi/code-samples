@@ -1,0 +1,146 @@
+//library 'name@version'
+
+properties([
+    disableConcurrentBuilds(),
+    // parameters([
+    //     booleanParam(name: 'deploy', defaultValue: false, description: 'deploy?'),
+    //     booleanParam(name: 'artifact', defaultValue: false, description: 'Save artifact?\n If deploy is true, this parameter is unuseful.')
+    // ]),
+    buildDiscarder(logRotator(numToKeepStr:"10"))
+])
+
+
+
+node("linux"){
+    stage("pull") {
+        def gitInfo = checkout scm
+        genInformationalVersion(gitInfo.GIT_COMMIT)        
+    }
+    parallel ut:{
+            ut()
+        }, vuebuild:{
+            buildUI()
+        }
+    if(JOB_BASE_NAME.indexOf('PR')==-1 && genVersion() != null || env.TAG_NAME != null){
+        if(params.artifact || params.deploy || env.TAG_NAME != null){
+            publish()
+            archiveZip()
+        }
+        if(params.deploy){
+            deploy()
+        }
+    }
+    if(JOB_BASE_NAME.indexOf('PR')==0 || env.TAG_NAME != null){
+        deleteDir()
+    }
+}
+
+def deploy(){
+    node('windows'){
+        stage('deploy'){
+            unstash 'publish'
+            //do deploy on windows
+        }
+        deleteDir()
+    }
+}
+
+def archiveZip(){
+    stage('save artifact'){
+        zip archive: false, dir: 'publish/api/', glob: '', zipFile: "${BUILD_NUMBER}.zip"
+    }
+}
+
+// def deployIisApp(String iisPath, String contentPath, servers){
+//     for(int i=0;i< servers.size();++i){                        
+//         echo "Deploy ${contentPath} to |${servers[i].ip}| ${iisPath}"
+//         withCredentials([usernamePassword(credentialsId: servers[i].credentialsId , passwordVariable: 'Pwd', usernameVariable: 'PublishUser')]) {                          
+//             bat """                        
+//             ${msdeploy} -verb:sync -source:Iisapp='${WORKSPACE}\\${contentPath}' -dest:iisapp='${iisPath}',computerName='https://${servers[i].ip}:8172/msdeploy.axd',userName='${PublishUser}',password='${Pwd}',authType='Basic' -enablerule:AppOffline -allowuntrusted """
+//         }     
+//     }
+// }
+
+def ut(){
+    stage("UT") {
+        def command = 'dotnet test -l \"trx;LogFileName=testresult.xml\"'
+        def build = 'dotnet build'
+        if(isUnix()){
+            withSdk(){
+                echo 'before build'                
+                sh build
+                try{
+                    sh command
+                }catch(ex){}           
+            }
+        }else{
+            ansiColor('xterm') {
+                bat build
+                try{
+                    bat command          
+                }catch(ex){}
+            }
+        } 
+        xunit thresholds: [failed(failureThreshold: '0')], tools: [MSTest(deleteOutputFiles: true, failIfNotNew: true, pattern: 'test/Ekyc.Test/TestResults/*.xml', skipNoTestFiles: true, stopProcessingIfError: false)]
+    }
+}
+
+def getStrongVersion(){
+    if(env.TAG_NAME != null){
+        return env.TAG_NAME.replace('v','');
+    }
+    return null
+}
+
+def publish(){
+    stage('publish'){                        
+        def command = "dotnet publish /p:InformationalVersion=\"${env.InformationalVersion}\""
+        if(getStrongVersion()!=null){
+            command += "-p:version=${getStrongVersion()}"
+        }
+        command += " -c release -v m -o ../../publish/api"
+        if(isUnix()){
+            withSdk(){
+                sh command
+            }
+        }else{
+            bat command
+        }
+        //push to nexs?
+        if(params.deploy)
+            stash includes: 'publish/**', name: 'publish'
+    }
+}
+
+def withSdk(String args = null, Closure body=null){    
+    withDNCSdk('itdf-hub.mercedes-benz-finance.com.cn/ms/dotnet:2.2.104-sdk',args,body)
+}
+
+def setEnvValue(){
+    env.myJobValue = 'hello,my value'
+}
+
+def withDNCSdk(String image,String args = null,Closure body=null){
+    if(image ==null || image =='')
+    {
+        error 'argument is null [image]'
+    }
+    sh "mkdir -p /var/lib/jenkins/.dotnet_in_docker"
+    sh "mkdir -p /var/lib/jenkins/.nuget_in_docker"    
+    def proxy = defaultProxy()
+    def command_args =[        
+        "-e http_proxy=${proxy.http}",
+        "-e https_proxy=${proxy.https}",
+        "-v '/var/lib/jenkins/.dotnet_in_docker:/.dotnet'",
+        "-v '/var/lib/jenkins/.nuget_in_docker:/.nuget'",
+        args
+    ]
+    ansiColor('xterm') {
+        docker.image(image).inside(buildCommand(command_args)) {                            
+            if(body){ body() }
+        }
+    }
+}
+// def withSdk(Closure body=null){
+//     withDNCSdk2_2("-v '${WORKSPACE}/nuget.config:/nuget.config:ro'",body)
+// }
